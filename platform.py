@@ -17,7 +17,6 @@ import urllib
 import sys
 import json
 import re
-import requests
 
 from platformio.public import PlatformBase, to_unix_path
 
@@ -47,11 +46,17 @@ class Espressif32Platform(PlatformBase):
         if os.path.isdir("ulp"):
             self.packages["toolchain-esp32ulp"]["optional"] = False
 
+        # Currently only Arduino Nano ESP32 uses the dfuutil tool as uploader
+        if variables.get("board") == "arduino_nano_esp32":
+            self.packages["tool-dfuutil-arduino"]["optional"] = False
+        else:
+            del self.packages["tool-dfuutil-arduino"]
+
         build_core = variables.get(
             "board_build.core", board_config.get("build.core", "arduino")
         ).lower()
 
-        if len(frameworks) == 1 and "arduino" in frameworks and build_core == "esp32":
+        if frameworks == ["arduino"] and build_core == "esp32":
             # In case the upstream Arduino framework is specified in the configuration
             # file then we need to dynamically extract toolchain versions from the
             # Arduino index file. This feature can be disabled via a special option:
@@ -88,50 +93,66 @@ class Espressif32Platform(PlatformBase):
                         sys.exit(1)
 
         if "espidf" in frameworks:
-            if "arduino" in frameworks:
-                self.packages["framework-arduinoespressif32"]["version"] = "~3.20003.0"
+            if frameworks == ["espidf"]:
+                # Starting from v12, Espressif's toolchains are shipped without
+                # bundled GDB. Instead, it's distributed as separate packages for Xtensa
+                # and RISC-V targets. Currently only IDF depends on the latest toolchain
+                for gdb_package in ("tool-xtensa-esp-elf-gdb", "tool-riscv32-esp-elf-gdb"):
+                    self.packages[gdb_package]["optional"] = False
+                    if IS_WINDOWS:
+                        # Note: On Windows GDB v12 is not able to
+                        # launch a GDB server in pipe mode while v11 works fine
+                        self.packages[gdb_package]["version"] = "~11.2.0"
+
             # Common packages for IDF and mixed Arduino+IDF projects
             for p in self.packages:
-                if p in ("tool-cmake", "tool-ninja", "toolchain-%sulp" % mcu):
+                if p in ("tool-cmake", "tool-ninja", "toolchain-esp32ulp"):
                     self.packages[p]["optional"] = False
                 elif p in ("tool-mconf", "tool-idf") and IS_WINDOWS:
                     self.packages[p]["optional"] = False
 
-        for available_mcu in ("esp32", "esp32s2", "esp32s3"):
-            if available_mcu == mcu:
-                self.packages["toolchain-xtensa-%s" % mcu]["optional"] = False
+            if "arduino" in frameworks:
+                # Downgrade the IDF version for mixed Arduino+IDF projects
+                self.packages["framework-espidf"]["version"] = "~3.40407.0"
+                # Delete the latest toolchain packages from config
+                self.packages.pop("toolchain-xtensa-esp-elf", None)
             else:
-                self.packages.pop("toolchain-xtensa-%s" % available_mcu, None)
+                # Disable old toolchain packages and use the latest
+                # available for IDF v5.0
+                for target in (
+                    "xtensa-esp32",
+                    "xtensa-esp32s2",
+                    "xtensa-esp32s3",
+                ):
+                    self.packages.pop("toolchain-%s" % target, None)
 
-        if mcu in ("esp32s2", "esp32s3", "esp32c3"):
-            self.packages.pop("toolchain-esp32ulp", None)
-            if mcu != "esp32s2":
-                self.packages.pop("toolchain-esp32s2ulp", None)
-            # RISC-V based toolchain for ESP32C3, ESP32S2, ESP32S3 ULP
+                if mcu in ("esp32c3", "esp32c6"):
+                    self.packages.pop("toolchain-xtensa-esp-elf", None)
+                else:
+                    self.packages["toolchain-xtensa-esp-elf"][
+                        "optional"
+                    ] = False
+
+                # Pull the latest RISC-V toolchain from PlatformIO organization
+                self.packages["toolchain-riscv32-esp"]["owner"] = "platformio"
+                self.packages["toolchain-riscv32-esp"][
+                    "version"
+                ] = "13.2.0+20230928"
+
+        if "arduino" in frameworks:
+            # Disable standalone GDB packages for Arduino and Arduino/IDF projects
+            for gdb_package in ("tool-xtensa-esp-elf-gdb", "tool-riscv32-esp-elf-gdb"):
+                self.packages.pop(gdb_package, None)
+
+            for available_mcu in ("esp32", "esp32s2", "esp32s3"):
+                if available_mcu == mcu:
+                    self.packages["toolchain-xtensa-%s" % mcu]["optional"] = False
+                else:
+                    self.packages.pop("toolchain-xtensa-%s" % available_mcu, None)
+
+        if mcu in ("esp32s2", "esp32s3", "esp32c3", "esp32c6"):
+            # RISC-V based toolchain for ESP32C3, ESP32C6 ESP32S2, ESP32S3 ULP
             self.packages["toolchain-riscv32-esp"]["optional"] = False
-
-        if build_core == "mbcwb":
-            # Remove the main toolchains from PATH
-            for toolchain in (
-                "toolchain-xtensa-esp32",
-                "toolchain-xtensa-esp32s2",
-                "toolchain-xtensa-esp32s3",
-                "toolchain-riscv32-esp",
-            ):
-                self.packages.pop(toolchain, None)
-
-            # Add legacy toolchain with specific version
-            self.packages["toolchain-xtensa32"] = {
-                "type": "toolchain",
-                "owner": "platformio",
-                "version": "~2.50200.0"
-            }
-
-            if build_core == "mbcwb":
-                self.packages["framework-arduinoespressif32"]["optional"] = True
-                self.packages["framework-arduino-mbcwb"]["optional"] = False
-                self.packages["tool-mbctool"]["type"] = "uploader"
-                self.packages["tool-mbctool"]["optional"] = False
 
         return super().configure_default_packages(variables, targets)
 
@@ -155,7 +176,7 @@ class Espressif32Platform(PlatformBase):
 
         # debug tools
         debug = board.manifest.get("debug", {})
-        non_debug_protocols = ["esptool", "espota", "mbctool"]
+        non_debug_protocols = ["esptool", "espota"]
         supported_debug_tools = [
             "cmsis-dap",
             "esp-prog",
@@ -170,7 +191,11 @@ class Espressif32Platform(PlatformBase):
             "tumpa",
         ]
 
-        if board.get("build.mcu", "") in ("esp32c3", "esp32s3"):
+        # A special case for the Kaluga board that has a separate interface config
+        if board.id == "esp32-s2-kaluga-1":
+            supported_debug_tools.append("ftdi")
+
+        if board.get("build.mcu", "") in ("esp32c3", "esp32c6", "esp32s3"):
             supported_debug_tools.append("esp-builtin")
 
         upload_protocol = board.manifest.get("upload", {}).get("protocol")
@@ -240,6 +265,10 @@ class Espressif32Platform(PlatformBase):
                 "default": link == debug.get("default_tool"),
             }
 
+            # Avoid erasing Arduino Nano bootloader by preloading app binary
+            if board.id == "arduino_nano_esp32":
+                debug["tools"][link]["load_cmds"] = "preload"
+
         board.manifest["debug"] = debug
         return board
 
@@ -249,7 +278,7 @@ class Espressif32Platform(PlatformBase):
 
         if "openocd" in (debug_config.server or {}).get("executable", ""):
             debug_config.server["arguments"].extend(
-                ["-c", "adapter_khz %s" % (debug_config.speed or "5000")]
+                ["-c", "adapter speed %s" % (debug_config.speed or "5000")]
             )
 
         ignore_conds = [
@@ -261,23 +290,16 @@ class Espressif32Platform(PlatformBase):
         if any(ignore_conds):
             return
 
-        merged_firmware = build_extra_data.get("merged_firmware", False)
-        load_cmds = []
-        if not merged_firmware:
-            load_cmds.extend([
-                'monitor program_esp "{{{path}}}" {offset} verify'.format(
-                    path=to_unix_path(item["path"]), offset=item["offset"]
-                )
-                for item in flash_images
-            ])
-
+        load_cmds = [
+            'monitor program_esp "{{{path}}}" {offset} verify'.format(
+                path=to_unix_path(item["path"]), offset=item["offset"]
+            )
+            for item in flash_images
+        ]
         load_cmds.append(
             'monitor program_esp "{%s.bin}" %s verify'
             % (
-                to_unix_path(
-                    debug_config.build_data["prog_path"][:-4]
-                    + ("_merged" if merged_firmware else "")
-                ),
+                to_unix_path(debug_config.build_data["prog_path"][:-4]),
                 build_extra_data.get("application_offset", "0x10000"),
             )
         )
@@ -287,11 +309,24 @@ class Espressif32Platform(PlatformBase):
     def extract_toolchain_versions(tool_deps):
         def _parse_version(original_version):
             assert original_version
-            match = re.match(r"^gcc(\d+)_(\d+)_(\d+)\-esp\-(.+)$", original_version)
-            if not match:
-                raise ValueError("Bad package version `%s`" % original_version)
-            assert len(match.groups()) == 4
-            return "%s.%s.%s+%s" % (match.groups())
+            version_patterns = (
+                r"^gcc(?P<MAJOR>\d+)_(?P<MINOR>\d+)_(?P<PATCH>\d+)-esp-(?P<EXTRA>.+)$",
+                r"^esp-(?P<EXTRA>.+)-(?P<MAJOR>\d+)\.(?P<MINOR>\d+)\.?(?P<PATCH>\d+)$",
+                r"^esp-(?P<MAJOR>\d+)\.(?P<MINOR>\d+)\.(?P<PATCH>\d+)(_(?P<EXTRA>.+))?$",
+            )
+            for pattern in version_patterns:
+                match = re.search(pattern, original_version)
+                if match:
+                    result = "%s.%s.%s" % (
+                        match.group("MAJOR"),
+                        match.group("MINOR"),
+                        match.group("PATCH"),
+                    )
+                    if match.group("EXTRA"):
+                        result = result + "+%s" % match.group("EXTRA")
+                    return result
+
+            raise ValueError("Bad package version `%s`" % original_version)
 
         if not tool_deps:
             raise ValueError(
@@ -335,16 +370,15 @@ class Espressif32Platform(PlatformBase):
             )
 
         index_file_url = _prepare_url_for_index_file(url_items)
-        r = requests.get(index_file_url, timeout=10)
-        if r.status_code != 200:
-            raise ValueError(
-                (
-                    "Failed to download package index file due to a bad response (%d) "
-                    "from the remote `%s`"
-                )
-                % (r.status_code, index_file_url)
-            )
-        return r.json()
+
+        try:
+            from platformio.public import fetch_http_content
+            content = fetch_http_content(index_file_url)
+        except ImportError:
+            import requests
+            content = requests.get(index_file_url, timeout=5).text
+
+        return json.loads(content)
 
     def configure_arduino_toolchains(self, package_index):
         if not package_index:

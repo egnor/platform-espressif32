@@ -16,7 +16,7 @@ import os
 
 from platformio import fs
 from platformio.util import get_systype
-from platformio.proc import where_is_program
+from platformio.proc import where_is_program, exec_command
 
 from SCons.Script import Import
 
@@ -34,16 +34,16 @@ ULP_BUILD_DIR = os.path.join(
 def prepare_ulp_env_vars(env):
     ulp_env.PrependENVPath("IDF_PATH", FRAMEWORK_DIR)
 
+    toolchain_path = platform.get_package_dir(
+        "toolchain-xtensa-esp-elf"
+        if "arduino" not in env.subst("$PIOFRAMEWORK")
+        else "toolchain-xtensa-%s" % idf_variant
+    )
+
     additional_packages = [
+        toolchain_path,
         os.path.join(
-            platform.get_package_dir(
-                "toolchain-xtensa-esp%s"
-                % ("32s2" if idf_variant == "esp32s2" else "32")
-            ),
-            "bin",
-        ),
-        os.path.join(
-            platform.get_package_dir("toolchain-%sulp" % idf_variant),
+            platform.get_package_dir("toolchain-esp32ulp"),
             "bin",
         ),
         platform.get_package_dir("tool-ninja"),
@@ -80,39 +80,50 @@ def get_component_includes(target_config):
 
 
 def generate_ulp_config(target_config):
-    riscv_ulp_enabled = sdk_config.get("ESP32S2_ULP_COPROC_RISCV", False)
+    def _generate_ulp_configuration_action(env, target, source):
+        riscv_ulp_enabled = sdk_config.get("ULP_COPROC_TYPE_RISCV", False)
+
+        cmd = (
+            os.path.join(platform.get_package_dir("tool-cmake"), "bin", "cmake"),
+            "-DCMAKE_GENERATOR=Ninja",
+            "-DCMAKE_TOOLCHAIN_FILE="
+            + os.path.join(
+                FRAMEWORK_DIR,
+                "components",
+                "ulp",
+                "cmake",
+                "toolchain-%sulp%s.cmake"
+                % (
+                    "" if riscv_ulp_enabled else idf_variant + "-",
+                    "-riscv" if riscv_ulp_enabled else "",
+                ),
+            ),
+            "-DULP_S_SOURCES=%s" % ";".join([s.get_abspath() for s in source]),
+            "-DULP_APP_NAME=ulp_main",
+            "-DCOMPONENT_DIR=" + os.path.join(ulp_env.subst("$PROJECT_DIR"), "ulp"),
+            "-DCOMPONENT_INCLUDES=%s" % ";".join(get_component_includes(target_config)),
+            "-DIDF_TARGET=%s" % idf_variant,
+            "-DIDF_PATH=" + fs.to_unix_path(FRAMEWORK_DIR),
+            "-DSDKCONFIG_HEADER=" + os.path.join(BUILD_DIR, "config", "sdkconfig.h"),
+            "-DPYTHON=" + env.subst("$PYTHONEXE"),
+            "-DULP_COCPU_IS_RISCV=%s" % ("ON" if riscv_ulp_enabled else "OFF"),
+            "-GNinja",
+            "-B",
+            ULP_BUILD_DIR,
+            os.path.join(FRAMEWORK_DIR, "components", "ulp", "cmake"),
+        )
+
+        exec_command(cmd)
 
     ulp_sources = collect_ulp_sources()
-    cmd = (
-        os.path.join(platform.get_package_dir("tool-cmake"), "bin", "cmake"),
-        "-DCMAKE_GENERATOR=Ninja",
-        "-DCMAKE_TOOLCHAIN_FILE="
-        + os.path.join(
-            FRAMEWORK_DIR,
-            "components",
-            "ulp",
-            "cmake",
-            "toolchain-%s-ulp%s.cmake"
-            % (idf_variant, "-riscv" if riscv_ulp_enabled else ""),
-        ),
-        '-DULP_S_SOURCES="%s"' % ";".join(ulp_sources),
-        "-DULP_APP_NAME=ulp_main",
-        "-DCOMPONENT_DIR=" + os.path.join(ulp_env.subst("$PROJECT_DIR"), "ulp"),
-        '-DCOMPONENT_INCLUDES="%s"' % ";".join(get_component_includes(target_config)),
-        "-DIDF_PATH=" + fs.to_unix_path(FRAMEWORK_DIR),
-        "-DSDKCONFIG_HEADER=" + os.path.join(BUILD_DIR, "config", "sdkconfig.h"),
-        "-DPYTHON=" + env.subst("$PYTHONEXE"),
-        "-DULP_COCPU_IS_RISCV=%s" % ("ON" if riscv_ulp_enabled else "OFF"),
-        "-GNinja",
-        "-B",
-        ULP_BUILD_DIR,
-        os.path.join(FRAMEWORK_DIR, "components", "ulp", "cmake"),
-    )
+    ulp_sources.sort()
 
     return ulp_env.Command(
         os.path.join(ULP_BUILD_DIR, "build.ninja"),
         ulp_sources,
-        ulp_env.VerboseAction(" ".join(cmd), "Generating ULP configuration"),
+        ulp_env.VerboseAction(
+            _generate_ulp_configuration_action, "Generating ULP configuration"
+        ),
     )
 
 
@@ -125,15 +136,19 @@ def compile_ulp_binary():
         "build",
     )
 
-    return ulp_env.Command(
+    # The `build.ninja` dependency is always generated with the same content
+    # so a cloned environment with a decider that depends on a timestamp is used
+    ulp_binary_env = ulp_env.Clone()
+    ulp_binary_env.Decider("timestamp-newer")
+
+    return ulp_binary_env.Command(
         [
             os.path.join(ULP_BUILD_DIR, "ulp_main.h"),
             os.path.join(ULP_BUILD_DIR, "ulp_main.ld"),
             os.path.join(ULP_BUILD_DIR, "ulp_main.bin"),
-            os.path.join(ULP_BUILD_DIR, "esp32.ulp.ld"),
         ],
         None,
-        ulp_env.VerboseAction(" ".join(cmd), "Generating ULP project files $TARGETS"),
+        ulp_binary_env.VerboseAction(" ".join(cmd), "Generating ULP project files $TARGETS"),
     )
 
 
